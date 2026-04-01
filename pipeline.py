@@ -5,9 +5,14 @@ Orchestrates two agents:
   2. Publisher Agent — converts the report to MDX and publishes it to the website
 
 Usage:
-    python pipeline.py
+    python pipeline.py                        # interactive mode
+    python pipeline.py --topic "AI in medicine" --type blog
+    python pipeline.py --auto                 # picks next topic from daily_topics.json
 """
 
+import argparse
+import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -15,10 +20,11 @@ from pathlib import Path
 import anyio
 from claude_agent_sdk import AgentDefinition, ClaudeAgentOptions, ResultMessage, query
 
-# Paths
+# Paths — WEBSITE_DIR can be overridden via env var (used in CI)
 ROOT = Path(__file__).parent.resolve()
-WEBSITE_DIR = ROOT / "website"
+WEBSITE_DIR = Path(os.environ.get("WEBSITE_DIR", ROOT / "website"))
 REPORTS_DIR = ROOT / "reports"
+TOPICS_FILE = ROOT / "daily_topics.json"
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +90,42 @@ def gather_inputs() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Auto mode: pick next topic from daily_topics.json
+# ---------------------------------------------------------------------------
+
+def pick_next_topic() -> dict:
+    if not TOPICS_FILE.exists():
+        print(f"Error: {TOPICS_FILE} not found. Create it or run in interactive mode.")
+        sys.exit(1)
+
+    data = json.loads(TOPICS_FILE.read_text(encoding="utf-8"))
+    topics = data.get("topics", [])
+    last_index = data.get("last_index", -1)
+
+    if not topics:
+        print("Error: No topics found in daily_topics.json.")
+        sys.exit(1)
+
+    next_index = (last_index + 1) % len(topics)
+    entry = topics[next_index]
+
+    # Save the updated index back
+    data["last_index"] = next_index
+    TOPICS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    print(f"\nAuto mode: picked topic {next_index + 1}/{len(topics)}: {entry['topic']}")
+    return {
+        "topic": entry["topic"],
+        "content_type": entry.get("type", "blog"),
+        "tags": entry.get("tags", []),
+        "authors": entry.get("authors", []),
+        "venue": entry.get("venue", ""),
+        "doi": entry.get("doi", ""),
+        "docs_dir": None,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Agent system prompts
 # ---------------------------------------------------------------------------
 
@@ -144,14 +186,13 @@ and source links from the original report.
 
 async def run_pipeline(inputs: dict) -> None:
     topic = inputs["topic"]
-    content_type = inputs["content_type"]  # "blog" or "papers"
+    content_type = inputs["content_type"]
     tags = inputs["tags"]
     authors = inputs["authors"]
     venue = inputs["venue"]
     doi = inputs["doi"]
     docs_dir = inputs["docs_dir"]
 
-    # Prepare paths
     REPORTS_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_topic = "".join(c if c.isalnum() or c in " _-" else "_" for c in topic)
@@ -162,7 +203,6 @@ async def run_pipeline(inputs: dict) -> None:
     publish_path = WEBSITE_DIR / "content" / content_type / f"{slug}.mdx"
     today = datetime.now().strftime("%Y-%m-%d")
 
-    # Build frontmatter fields for the publisher
     frontmatter_fields = f"""title: (derive a concise title from the report)
 date: "{today}"
 excerpt: (write a 1-2 sentence summary based on the report's Summary section)
@@ -175,7 +215,6 @@ venue: "{venue}"
 doi: "{doi}"
 """
 
-    # Define subagents
     research_tools = ["WebSearch", "WebFetch", "Write"]
     if docs_dir:
         research_tools += ["Read", "Glob", "Grep"]
@@ -193,7 +232,6 @@ doi: "{doi}"
         ),
     }
 
-    # Orchestrator prompt
     orchestrator_prompt = f"""You are coordinating a research-to-publish pipeline. Follow these steps in order:
 
 STEP 1 — Research
@@ -240,6 +278,7 @@ After both steps complete, summarize what was researched and confirm the file wa
             print("\n" + "=" * 60)
             if message.is_error:
                 print(f"Pipeline failed: {message.result}")
+                sys.exit(1)
             else:
                 print("Pipeline complete!\n")
                 if message.result:
@@ -253,7 +292,28 @@ After both steps complete, summarize what was researched and confirm the file wa
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    inputs = gather_inputs()
+    parser = argparse.ArgumentParser(description="Research-to-publish multi-agent pipeline.")
+    parser.add_argument("--topic", help="Research topic (skips interactive prompt)")
+    parser.add_argument("--type", choices=["blog", "papers"], default="blog", dest="content_type")
+    parser.add_argument("--tags", help="Comma-separated tags", default="")
+    parser.add_argument("--auto", action="store_true", help="Pick next topic from daily_topics.json")
+    args = parser.parse_args()
+
+    if args.auto:
+        inputs = pick_next_topic()
+    elif args.topic:
+        inputs = {
+            "topic": args.topic,
+            "content_type": args.content_type,
+            "tags": [t.strip() for t in args.tags.split(",") if t.strip()],
+            "authors": [],
+            "venue": "",
+            "doi": "",
+            "docs_dir": None,
+        }
+    else:
+        inputs = gather_inputs()
+
     anyio.run(run_pipeline, inputs)
 
 
